@@ -1,0 +1,36 @@
+# ── Secrets / credentials ─────────────────────────────────────────────────────
+.env
+*.pem
+*.key
+*.p12
+id_rsa
+id_ed25519
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# ── Benchmark results (raw run data — commit summary JSONs manually) ──────────
+results/*.jsonl
+results/*.log
+results/raw/
+
+# ── macOS / editors ───────────────────────────────────────────────────────────
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# ── Model files (large; never commit) ────────────────────────────────────────
+*.gguf
+*.safetensors
+*.bin
+*.pt
