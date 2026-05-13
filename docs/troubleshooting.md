@@ -2,6 +2,85 @@
 
 ---
 
+## INCIDENT: Base environment polluted during setup (2026-05-13)
+
+### What happened
+
+During Phase-1 setup, multiple `pip install` attempts in the **global Python environment**
+created a broken, conflicting state. This is the root cause of all subsequent failures.
+
+**Timeline of damage:**
+1. `pip install vllm` (latest, 0.20.2) → pulled `torch 2.11.0+cu130` (CUDA) over existing ROCm torch
+2. Force-reinstall `torch 2.3.1+rocm5.7` to recover GPU
+3. `pip install vllm==0.5.3` → installs, but no GGUF and no Qwen3 arch support
+4. `pip install transformers==4.46.3` → downgrade attempt
+5. `pip install torch 2.5.1+rocm6.2` → ROCm upgrade attempt
+6. `pip install vllm>=0.6.0 --upgrade` → pulled `torch 2.5.1+rocm6.2` + `torchaudio 2.11.0` (CUDA mismatch)
+7. Force-reinstall `torch 2.9.1+rocm6.3`
+8. `pip install vllm==0.16.0` → works, but Qwen3.6 needs Qwen3_5MoeForConditionalGeneration (not in 0.16.0)
+9. `pip install transformers --upgrade` → installs 5.8.1, conflicts with vllm 0.16.0 (`requires <5`)
+10. `pip install transformers==4.57.6` → downgrade again
+11. `pip install transformers==5.8.1` → upgrade again to recognize qwen3_5_moe
+
+**Current broken state (as of 2026-05-13):**
+```
+torch:         2.9.1+rocm6.3  (GPU visible — this part works)
+vllm:          NOT INSTALLED   (was 0.16.0, then removed during repeated attempts)
+transformers:  4.57.6          (downgraded, may be incomplete)
+amdsmi:        23.2.0.1        (installed for vLLM platform detection)
+ROCm userspace:/opt/rocm-5.7.0 (system-level, not changed)
+AMDGPU driver: 6.10.5
+Docker:        NOT AVAILABLE in this pod
+```
+
+### Why the base environment approach failed
+
+- RunPod pods run a pre-configured Docker container with a specific Python environment
+- `pip install` into the global site-packages breaks other system tools that depend on those versions
+- vLLM on PyPI is the **CUDA** build — it always wants `torch==2.x.y+cu*`
+- **The ROCm build of vLLM is not on PyPI** — it lives at `https://wheels.vllm.ai/rocm/`
+- Mixing PyPI vLLM with ROCm torch is the core mistake
+
+### What the correct path looks like
+
+**Official vLLM ROCm wheels** (from `https://wheels.vllm.ai/rocm/`):
+```bash
+# In a fresh virtual environment:
+pip install vllm==0.20.0+rocm721 \
+    --extra-index-url https://wheels.vllm.ai/rocm/0.20.0/rocm721
+```
+
+Requirements per official docs:
+- Python 3.12
+- ROCm 7.0 or higher (userspace)
+- glibc >= 2.35
+- **This pod has ROCm 5.7 userspace** — compatibility with ROCm 7.x wheels is UNKNOWN
+
+**Official serve command for Qwen3.6-35B-A3B-FP8 on MI300X:**
+```bash
+VLLM_ROCM_USE_AITER=1 vllm serve Qwen/Qwen3.6-35B-A3B-FP8 \
+    --max-model-len 262144 \
+    --reasoning-parser qwen3 \
+    --trust-remote-code
+```
+
+### Decision needed before next step
+
+Docker is not available in this pod (`docker: command not found`).
+
+Options ranked by risk:
+1. **Fresh RunPod pod** — choose a template with ROCm 7.x already installed.
+   Risk: none. Everything starts clean. This pod can stay running alongside.
+2. **Virtual env + vLLM ROCm wheel on current pod** — create `python3.12 -m venv /workspace/venv`
+   then install `vllm==0.20.0+rocm721`. Risk: unknown — may fail if ROCm 7.x libs not present.
+3. **Install ROCm 7.x userspace on current pod via apt** — add AMD apt repo, install ROCm 7.
+   Risk: high — could destabilize pod; no rollback.
+
+**Recommended: Option 2 (venv) first, fall back to Option 1 if wheels fail.**
+Ask before proceeding.
+
+---
+
 ## SSH / Connection issues
 
 ### "Connection refused" or timeout when SSHing
