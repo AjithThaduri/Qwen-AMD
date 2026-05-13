@@ -26,7 +26,7 @@ if [ -f /opt/rocm/.info/version ]; then
     echo "  Detected ROCm version: $ROCM_VERSION"
 else
     # Default to ROCm 6.x which is current on MI300X pods
-    ROCM_VERSION="6.1"
+    ROCM_VERSION="5.7"
     echo "  Could not detect ROCm version — defaulting to $ROCM_VERSION"
     echo "  If this is wrong, check: cat /opt/rocm/.info/version"
 fi
@@ -39,31 +39,31 @@ if python3 -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
     echo "  ✓  PyTorch with ROCm already available — skipping PyTorch install."
 else
     echo "  PyTorch not found or no GPU visible. Installing PyTorch for ROCm..."
-    # This installs PyTorch built for ROCm 6.x (matches MI300X on RunPod)
+    # ROCm version on this pod is 5.7 — use the matching PyTorch wheel.
+    # If your pod has a different ROCm version, change rocm5.7 below to match.
     pip3 install torch torchvision torchaudio \
-        --index-url https://download.pytorch.org/whl/rocm6.2
+        --index-url https://download.pytorch.org/whl/rocm5.7
     echo "  ✓  PyTorch installed."
 fi
 echo ""
 
-# ── Step 2: Install vLLM ROCm wheel ───────────────────────────────────────
-echo "→ Installing vLLM (ROCm wheel)..."
-echo "  This may take several minutes — the wheel is ~500 MB."
+# ── Step 2: Install vLLM ──────────────────────────────────────────────────
+echo "→ Installing vLLM..."
+echo "  This may take 5–15 minutes."
 echo ""
 
-# vLLM publishes ROCm-specific wheels. The index URL is:
-#   https://download.pytorch.org/whl/rocm<version>
-# We also check the vLLM GitHub releases for direct ROCm wheels.
+# Strategy:
+#   1. Try pip install vllm (works when torch with ROCm is already present)
+#   2. If that fails, try the ROCm 5.7 wheel index from pytorch.org
+#   ROCm 5.7 is supported by vLLM 0.5.x and later.
 
-# Try the ROCm-compatible pip index first:
 pip3 install vllm \
-    --index-url https://download.pytorch.org/whl/rocm6.2 \
     || {
         echo ""
-        echo "  ⚠  ROCm wheel from pytorch.org failed."
-        echo "     Trying plain pip install vllm (may get CPU-only)..."
+        echo "  ⚠  Plain vllm install failed. Trying ROCm 5.7 wheel index..."
         echo ""
-        pip3 install vllm
+        pip3 install vllm \
+            --index-url https://download.pytorch.org/whl/rocm5.7
     }
 
 echo ""
