@@ -27,6 +27,7 @@ from urllib.error import URLError
 CONFIG_PATH = Path("/workspace/configs/email.conf")
 DAILY_LOG_DIR = Path("/workspace/gpu_stats/daily")
 METRICS_URL = "http://localhost:8000/metrics"
+ERROR_STATE_FILE = Path("/tmp/vllm_error_alert_state")
 
 
 # ── config ────────────────────────────────────────────────────────────────────
@@ -75,9 +76,9 @@ def get_gpu_stats():
     power_out = run("rocm-smi --showpower 2>/dev/null")
 
     stats["vram_pct"]  = _parse_rocmsmi_value("GPU Memory Allocated", vram_out)
-    stats["temp_c"]    = _parse_rocmsmi_value("Temperature (Sensor edge)", temp_out)
+    stats["temp_c"]    = _parse_rocmsmi_value("Temperature (Sensor junction)", temp_out)
     stats["gpu_pct"]   = _parse_rocmsmi_value("GPU use", use_out)
-    stats["power_w"]   = _parse_rocmsmi_value("Average Graphics Package Power", power_out)
+    stats["power_w"]   = _parse_rocmsmi_value("Current Socket Graphics Package Power", power_out)
     stats["raw"]       = run("rocm-smi 2>/dev/null")
 
     return stats
@@ -102,10 +103,10 @@ def get_peak_stats_today():
         g = _try_float(_parse_rocmsmi_value("GPU use", line + "\n"))
         if g is not None:
             gpu_vals.append(g)
-        t = _try_float(_parse_rocmsmi_value("Temperature (Sensor edge)", line + "\n"))
+        t = _try_float(_parse_rocmsmi_value("Temperature (Sensor junction)", line + "\n"))
         if t is not None:
             temp_vals.append(t)
-        p = _try_float(_parse_rocmsmi_value("Average Graphics Package Power", line + "\n"))
+        p = _try_float(_parse_rocmsmi_value("Current Socket Graphics Package Power", line + "\n"))
         if p is not None:
             power_vals.append(p)
 
@@ -504,6 +505,145 @@ def build_alert_html(gpu, vllm, reason, now):
 </div></body></html>"""
 
 
+# ── error alert helpers ───────────────────────────────────────────────────────
+
+def get_error_delta():
+    """
+    Compare current failure count from /metrics against last saved value.
+    Returns (new_failures, total_failures, error_rate_pct, recent_log_lines).
+    Returns None if /metrics is unreachable.
+    """
+    metrics = get_vllm_metrics()
+    if metrics["requests_failed"] == "—":
+        return None
+
+    try:
+        total_failed = int(metrics["requests_failed"].replace(",", ""))
+        total_ok     = int(metrics["requests_ok"].replace(",", "") if metrics["requests_ok"] != "—" else 0)
+    except Exception:
+        return None
+
+    # Load previous failure count
+    prev_failed = 0
+    if ERROR_STATE_FILE.exists():
+        try:
+            prev_failed = int(ERROR_STATE_FILE.read_text().strip())
+        except Exception:
+            pass
+
+    new_failures = max(0, total_failed - prev_failed)
+
+    # Save current count
+    ERROR_STATE_FILE.write_text(str(total_failed))
+
+    total_requests = total_ok + total_failed
+    error_rate = (total_failed / total_requests * 100) if total_requests > 0 else 0
+
+    # Pull last 30 lines of vLLM serve log for context
+    serve_log = Path("/workspace/serve_awq.log")
+    log_lines = ""
+    if serve_log.exists():
+        lines = serve_log.read_text().splitlines()
+        # Filter to lines likely related to errors
+        error_lines = [l for l in lines if any(k in l for k in ["ERROR", "error", "400", "500", "Exception", "Traceback", "failed", "Failed"])]
+        log_lines = "\n".join(error_lines[-20:]) or "(no error lines found in log)"
+
+    return {
+        "new_failures":   new_failures,
+        "total_failed":   total_failed,
+        "total_ok":       total_ok,
+        "error_rate":     round(error_rate, 1),
+        "running":        metrics["running_requests"],
+        "waiting":        metrics["waiting_requests"],
+        "tokens_gen":     metrics["tokens_generated"],
+        "log_lines":      log_lines,
+    }
+
+
+def build_error_alert_html(gpu, vllm, err, now):
+    uptime_str = (f"Running — PID {vllm['pid']}, uptime {vllm['uptime']}"
+                  if vllm["running"] else "NOT RUNNING")
+
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">{STYLE}</head>
+<body><div class="wrapper">
+
+  <div class="header" style="background: linear-gradient(135deg, #1e1b4b 0%, #312e81 60%, #4f46e5 100%);">
+    <div class="tag">Alert · RunPod AMD MI300X</div>
+    <h1>⚠ Request Errors Detected</h1>
+    <p>{now.strftime('%A, %B %d %Y · %H:%M UTC')} &nbsp;·&nbsp; +{err['new_failures']} new failures in last 5 min</p>
+  </div>
+
+  <div class="card">
+    <div class="alert-box" style="background:#ede9fe; border-color:#a78bfa;">
+      <h3 style="color:#4c1d95;">{err['new_failures']} new failed requests detected</h3>
+      <p style="color:#4c1d95;">Overall error rate: <strong>{err['error_rate']}%</strong>
+         &nbsp;({err['total_failed']:,} failed / {err['total_ok'] + err['total_failed']:,} total)</p>
+    </div>
+
+    <p class="section-title">Request Counters</p>
+    <div class="stat-row"><span class="stat-key">New failures (this window)</span>
+      <span class="stat-val" style="color:#dc2626;">{err['new_failures']}</span></div>
+    <div class="stat-row"><span class="stat-key">Total failures (lifetime)</span>
+      <span class="stat-val">{err['total_failed']:,}</span></div>
+    <div class="stat-row"><span class="stat-key">Total successful (lifetime)</span>
+      <span class="stat-val">{err['total_ok']:,}</span></div>
+    <div class="stat-row"><span class="stat-key">Error rate (lifetime)</span>
+      <span class="stat-val">{err['error_rate']}%</span></div>
+    <div class="stat-row"><span class="stat-key">Requests running now</span>
+      <span class="stat-val">{err['running']}</span></div>
+    <div class="stat-row"><span class="stat-key">Requests waiting now</span>
+      <span class="stat-val">{err['waiting']}</span></div>
+    <div class="stat-row"><span class="stat-key">Tokens generated (total)</span>
+      <span class="stat-val">{err['tokens_gen']}</span></div>
+  </div>
+
+  <div class="card">
+    <p class="section-title">GPU State</p>
+    <div class="grid4">
+      {metric_box("VRAM Used", gpu['vram_pct'], "%")}
+      {metric_box("GPU Compute", gpu['gpu_pct'], "%")}
+      {metric_box("Die Temp", gpu['temp_c'], "°C")}
+      {metric_box("Power Draw", gpu['power_w'], "W")}
+    </div>
+  </div>
+
+  <div class="card">
+    <p class="section-title">Common Causes</p>
+    <table>
+      <tr><th>Cause</th><th>What It Means</th></tr>
+      <tr><td>400 Bad Request</td><td>Prompt too long for current <code>--max-model-len</code>, or malformed request body from the client.</td></tr>
+      <tr><td>500 Internal Error</td><td>vLLM crashed mid-generation, often an OOM or CUDA/ROCm kernel panic.</td></tr>
+      <tr><td>503 / timeout</td><td>Request queue full — more concurrent users than <code>--max-num-seqs</code> allows.</td></tr>
+    </table>
+
+    <hr class="divider">
+    <p class="section-title">Recommended Actions</p>
+    <table>
+      <tr><th>Action</th><th>Command</th></tr>
+      <tr><td>Check live metrics</td><td><code>curl -s http://localhost:8000/metrics | grep vllm:request</code></td></tr>
+      <tr><td>Check serve log</td><td><code>tmux attach -t vllm</code></td></tr>
+      <tr><td>Restart vLLM</td><td><code>bash /workspace/scripts/29_restart_vllm_production.sh</code></td></tr>
+    </table>
+  </div>
+
+  <div class="card">
+    <p class="section-title">vLLM Server</p>
+    <div class="stat-row"><span class="stat-key">Status</span>
+      <span class="stat-val">{uptime_str}</span></div>
+    <hr class="divider">
+    <p class="section-title">Recent Error Lines from serve_awq.log</p>
+    <pre>{err['log_lines']}</pre>
+  </div>
+
+  <div class="footer">
+    Generated by Qwen-AMD monitoring &nbsp;·&nbsp;
+    <a href="https://github.com/AjithThaduri/Qwen-AMD">AjithThaduri/Qwen-AMD</a>
+  </div>
+
+</div></body></html>"""
+
+
 # ── send ──────────────────────────────────────────────────────────────────────
 
 def send_email(cfg, subject, html_body):
@@ -527,9 +667,10 @@ def send_email(cfg, subject, html_body):
 def main():
     parser = argparse.ArgumentParser()
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--daily", action="store_true")
-    group.add_argument("--alert", action="store_true")
-    group.add_argument("--test",  action="store_true")
+    group.add_argument("--daily",       action="store_true")
+    group.add_argument("--alert",       action="store_true")
+    group.add_argument("--error-alert", action="store_true")
+    group.add_argument("--test",        action="store_true")
     args = parser.parse_args()
 
     cfg   = load_config()
@@ -562,6 +703,35 @@ def main():
                   f"GPU compute is at {gpu['gpu_pct']}%.")
         subject = f"[MI300X] VRAM ALERT {vram:.0f}% — {now.strftime('%b %d %H:%M UTC')}"
         html = build_alert_html(gpu, vllm, reason, now)
+        send_email(cfg, subject, html)
+
+    elif getattr(args, "error_alert"):
+        err = get_error_delta()
+        if err is None:
+            print("Could not reach /metrics — vLLM may be down. No alert sent.")
+            return
+        # Alert threshold: 5+ new failures in this 5-min window
+        if err["new_failures"] < 5:
+            print(f"{err['new_failures']} new failures — below threshold (5), no alert sent.")
+            return
+        # Cooldown: max one error alert per 30 minutes
+        cooldown_file = Path("/tmp/vllm_error_alert_cooldown")
+        import time
+        now_ts = int(time.time())
+        last_sent = 0
+        if cooldown_file.exists():
+            try:
+                last_sent = int(cooldown_file.read_text().strip())
+            except Exception:
+                pass
+        if now_ts - last_sent < 1800:
+            remaining = 1800 - (now_ts - last_sent)
+            print(f"{err['new_failures']} new failures but cooldown active — {remaining}s remaining.")
+            return
+        cooldown_file.write_text(str(now_ts))
+        subject = (f"[MI300X] ERROR ALERT — {err['new_failures']} failures "
+                   f"({err['error_rate']}% rate) — {now.strftime('%b %d %H:%M UTC')}")
+        html = build_error_alert_html(gpu, vllm, err, now)
         send_email(cfg, subject, html)
 
 

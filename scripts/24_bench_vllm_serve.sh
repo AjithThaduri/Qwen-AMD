@@ -25,7 +25,6 @@ RATES=(1 5 10 20)
 NUM_PROMPTS=200
 NUM_WARMUPS=5
 SHAREGPT_OUTPUT_LEN=256   # fix reply-length so benchmark doesn't need EOS from model
-MAX_INPUT_LEN=31744         # leave room for output within 32768 context window
 PERCENTILE_METRICS="ttft,tpot,itl,e2el"
 METRIC_PERCENTILES="50,90,95,99"
 
@@ -112,6 +111,10 @@ PROBE_OUT=$(vllm bench serve \
 
 if echo "$PROBE_OUT" | grep -q "Successful requests: *[1-9]"; then
     log "✓ Probe succeeded — proceeding to sweep."
+elif echo "$PROBE_OUT" | grep -q "unrecognized arguments\|error:"; then
+    log "✗ Probe got a flag error. Aborting — fix the benchmark flags."
+    echo "$PROBE_OUT" | tail -10 | tee -a "$LOGFILE"
+    exit 1
 elif echo "$PROBE_OUT" | grep -q "Bad Request\|400"; then
     log "✗ Probe got 400 Bad Request. Check vLLM serve log for the actual error detail:"
     log "  tmux attach -t vllm   # look for 'ValueError' or 'chat template' lines"
@@ -129,7 +132,6 @@ elif echo "$PROBE_OUT" | grep -q "Bad Request\|400"; then
         --dataset-name sharegpt \
         --dataset-path "$DATASET_PATH" \
         --sharegpt-output-len "$SHAREGPT_OUTPUT_LEN" \
-        --sharegpt-input-len "$MAX_INPUT_LEN" \
         --num-prompts 1 \
         --num-warmups 0 \
         --request-rate 1 \
@@ -172,7 +174,6 @@ for RATE in "${RATES[@]}"; do
         --dataset-name sharegpt \
         --dataset-path "$DATASET_PATH" \
         --sharegpt-output-len "$SHAREGPT_OUTPUT_LEN" \
-        --sharegpt-input-len "$MAX_INPUT_LEN" \
         --num-prompts "$NUM_PROMPTS" \
         --num-warmups "$NUM_WARMUPS" \
         --request-rate "$RATE" \
