@@ -15,8 +15,8 @@ set -euo pipefail
 
 # ─── TUNE THESE after reviewing benchmark results ────────────────────────────
 MAX_MODEL_LEN=16384           # tokens: 16K covers 95%+ of real-world requests
-GPU_MEM_UTIL=0.88             # 88% of 192 GB ≈ 169 GB; leaves ~23 GB headroom
-MAX_NUM_SEQS=128              # max concurrent requests in flight
+GPU_MEM_UTIL=0.80             # 80% of 192 GB = 154 GB; ~130 GB KV cache, 38 GB headroom
+MAX_NUM_SEQS=100              # cap slightly above 70-user peak; queues gracefully beyond
 # ─────────────────────────────────────────────────────────────────────────────
 
 ts() { date '+%H:%M:%S'; }

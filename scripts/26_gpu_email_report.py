@@ -139,6 +139,22 @@ def get_disk_usage():
     return {"workspace": workspace, "root": root}
 
 
+def get_gateway_usage():
+    """Read per-key usage from gateway stats file."""
+    stats_file = Path("/workspace/gateway_stats/usage.json")
+    if not stats_file.exists():
+        return None
+    try:
+        data = json.loads(stats_file.read_text())
+        total = {"requests": 0, "input_tokens": 0, "output_tokens": 0, "errors": 0}
+        for v in data.values():
+            for k in total:
+                total[k] += v.get(k, 0)
+        return {"keys": data, "total": total}
+    except Exception:
+        return None
+
+
 def get_vllm_metrics():
     """Fetch Prometheus /metrics and return request/token counts."""
     result = {
@@ -326,7 +342,50 @@ def disk_table(disk):
 
 # ── HTML builders ─────────────────────────────────────────────────────────────
 
-def build_daily_html(gpu, peaks, vllm, disk, metrics, now):
+def build_gateway_section(usage):
+    if not usage:
+        return ""
+    key_labels = {"dev": "Dev Key", "prod": "Production Key", "spare": "Spare Key"}
+    rows = ""
+    for name, label in key_labels.items():
+        d = usage["keys"].get(name, {})
+        last = d.get("last_used") or "Never"
+        if last != "Never":
+            try:
+                last = last[:16].replace("T", " ") + " UTC"
+            except Exception:
+                pass
+        err_style = ' style="color:#dc2626;font-weight:700;"' if d.get("errors", 0) > 0 else ""
+        rows += f"""
+        <tr>
+          <td><strong>{label}</strong></td>
+          <td>{d.get('requests', 0):,}</td>
+          <td>{d.get('input_tokens', 0):,}</td>
+          <td>{d.get('output_tokens', 0):,}</td>
+          <td{err_style}>{d.get('errors', 0):,}</td>
+          <td style="font-size:12px;color:#64748b">{last}</td>
+        </tr>"""
+    t = usage["total"]
+    rows += f"""
+        <tr style="background:#f8fafc;font-weight:600;">
+          <td>Total</td>
+          <td>{t.get('requests', 0):,}</td>
+          <td>{t.get('input_tokens', 0):,}</td>
+          <td>{t.get('output_tokens', 0):,}</td>
+          <td>{t.get('errors', 0):,}</td>
+          <td>—</td>
+        </tr>"""
+    return f"""
+    <div class="card">
+      <p class="section-title">API Gateway — Usage by Key</p>
+      <table>
+        <tr><th>Key</th><th>Requests</th><th>Input Tok</th><th>Output Tok</th><th>Errors</th><th>Last Used</th></tr>
+        {rows}
+      </table>
+    </div>"""
+
+
+def build_daily_html(gpu, peaks, vllm, disk, metrics, gateway, now):
     vllm_badge = ('<span class="badge badge-up">● Running</span>' if vllm["running"]
                   else '<span class="badge badge-down">● Stopped</span>')
     uptime_str = f"PID {vllm['pid']} · uptime {vllm['uptime']}" if vllm["running"] else "Not running"
@@ -395,6 +454,8 @@ def build_daily_html(gpu, peaks, vllm, disk, metrics, now):
   </div>
 
   {requests_section}
+
+  {build_gateway_section(gateway)}
 
   <div class="card">
     <p class="section-title">vLLM Server</p>
@@ -682,10 +743,11 @@ def main():
     if args.daily or args.test:
         peaks   = get_peak_stats_today()
         metrics = get_vllm_metrics()
+        gateway = get_gateway_usage()
         subject = (f"[MI300X] Daily GPU Report — {now.strftime('%b %d %Y')}"
                    if args.daily else
                    f"[MI300X] Test Email — {now.strftime('%b %d %Y %H:%M UTC')}")
-        html = build_daily_html(gpu, peaks, vllm, disk, metrics, now)
+        html = build_daily_html(gpu, peaks, vllm, disk, metrics, gateway, now)
         send_email(cfg, subject, html)
         if args.test:
             print("Test email sent.")
