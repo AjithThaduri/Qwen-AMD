@@ -1,0 +1,1 @@
+A SaaS company wants to serve 50 concurrent users on a single AMD MI300X using Qwen3.6-35B-A3B AWQ with vLLM. Analyze the likely bottlenecks, including prefill, decode, KV cache, batching, network latency, token limits, and quantization overhead. Provide a clear recommendation. Do not show hidden reasoning; give only the final structured answer.

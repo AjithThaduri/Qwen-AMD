@@ -1,0 +1,1 @@
+Write a production-ready Python FastAPI gateway that proxies OpenAI-compatible chat completion requests to a vLLM backend. Include API key auth, request timeout, streaming passthrough, basic logging, health endpoint, and clear comments. Do not show reasoning.
