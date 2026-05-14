@@ -3,37 +3,37 @@
 26_gpu_email_report.py
 Run this ON THE RUNPOD POD.
 
-Sends a daily HTML GPU report and/or a VRAM alert email.
-
 Modes:
-  python3 26_gpu_email_report.py --daily       # Send daily report (called by cron)
-  python3 26_gpu_email_report.py --alert        # Send VRAM alert (called by monitor)
-  python3 26_gpu_email_report.py --test         # Send test email to verify SMTP works
+  python3 26_gpu_email_report.py --daily   # daily morning report (cron)
+  python3 26_gpu_email_report.py --alert   # VRAM alert (called by monitor)
+  python3 26_gpu_email_report.py --test    # verify SMTP
 
-Config file: /workspace/configs/email.conf  (never committed to git)
+Config: /workspace/configs/email.conf  (never committed to git)
 """
 
 import argparse
-import json
 import os
+import re
 import smtplib
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
-
-# ── config ────────────────────────────────────────────────────────────────────
+from urllib.request import urlopen
+from urllib.error import URLError
 
 CONFIG_PATH = Path("/workspace/configs/email.conf")
+DAILY_LOG_DIR = Path("/workspace/gpu_stats/daily")
+METRICS_URL = "http://localhost:8000/metrics"
 
-# ── helpers ───────────────────────────────────────────────────────────────────
+
+# ── config ────────────────────────────────────────────────────────────────────
 
 def load_config():
     if not CONFIG_PATH.exists():
         print(f"ERROR: Config not found at {CONFIG_PATH}")
-        print("Run setup first: bash /workspace/scripts/26_setup_email_config.sh")
         sys.exit(1)
     cfg = {}
     for line in CONFIG_PATH.read_text().splitlines():
@@ -44,42 +44,89 @@ def load_config():
     return cfg
 
 
+# ── data collection ───────────────────────────────────────────────────────────
+
 def run(cmd):
     try:
         return subprocess.check_output(cmd, shell=True, stderr=subprocess.DEVNULL, text=True).strip()
     except Exception:
-        return "N/A"
+        return ""
+
+
+def _parse_rocmsmi_value(key_pattern, output):
+    """Extract the last colon-separated field from a rocm-smi verbose line."""
+    for line in output.splitlines():
+        if key_pattern.lower() in line.lower():
+            # Split on ': ' and take the last token
+            parts = re.split(r':\s*', line)
+            if len(parts) >= 2:
+                val = parts[-1].strip().rstrip('%').rstrip('c').rstrip('C').rstrip('W').strip()
+                if val:
+                    return val
+    return "?"
 
 
 def get_gpu_stats():
-    """Returns dict of GPU metrics from rocm-smi."""
     stats = {}
 
-    # VRAM used / total
-    vram_used = run("rocm-smi --showmemuse 2>/dev/null | grep 'GPU Memory Allocated' | awk -F: '{print $2}' | tr -d ' %'")
-    stats["vram_pct"] = vram_used if vram_used != "N/A" else "?"
+    vram_out  = run("rocm-smi --showmemuse 2>/dev/null")
+    temp_out  = run("rocm-smi --showtemp  2>/dev/null")
+    use_out   = run("rocm-smi --showuse   2>/dev/null")
+    power_out = run("rocm-smi --showpower 2>/dev/null")
 
-    # Temperature
-    temp = run("rocm-smi --showtemp 2>/dev/null | grep 'Temperature (Sensor edge)' | awk -F: '{print $2}' | tr -d ' c'")
-    stats["temp_c"] = temp if temp != "N/A" else "?"
-
-    # GPU utilisation
-    gpu_use = run("rocm-smi --showuse 2>/dev/null | grep 'GPU use' | awk -F: '{print $2}' | tr -d ' %'")
-    stats["gpu_pct"] = gpu_use if gpu_use != "N/A" else "?"
-
-    # Power draw
-    power = run("rocm-smi --showpower 2>/dev/null | grep 'Average Graphics Package' | awk -F: '{print $2}' | tr -d ' W'")
-    stats["power_w"] = power if power != "N/A" else "?"
-
-    # Full rocm-smi table for email body
-    stats["raw"] = run("rocm-smi 2>/dev/null")
+    stats["vram_pct"]  = _parse_rocmsmi_value("GPU Memory Allocated", vram_out)
+    stats["temp_c"]    = _parse_rocmsmi_value("Temperature (Sensor edge)", temp_out)
+    stats["gpu_pct"]   = _parse_rocmsmi_value("GPU use", use_out)
+    stats["power_w"]   = _parse_rocmsmi_value("Average Graphics Package Power", power_out)
+    stats["raw"]       = run("rocm-smi 2>/dev/null")
 
     return stats
 
 
+def get_peak_stats_today():
+    """Read today's daily log and return peak VRAM/GPU/temp from it."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    log_file = DAILY_LOG_DIR / f"{today}.log"
+    peaks = {"vram_pct": "—", "gpu_pct": "—", "temp_c": "—", "power_w": "—"}
+
+    if not log_file.exists():
+        return peaks
+
+    text = log_file.read_text()
+    vram_vals, gpu_vals, temp_vals, power_vals = [], [], [], []
+
+    for line in text.splitlines():
+        v = _try_float(_parse_rocmsmi_value("GPU Memory Allocated", line + "\n"))
+        if v is not None:
+            vram_vals.append(v)
+        g = _try_float(_parse_rocmsmi_value("GPU use", line + "\n"))
+        if g is not None:
+            gpu_vals.append(g)
+        t = _try_float(_parse_rocmsmi_value("Temperature (Sensor edge)", line + "\n"))
+        if t is not None:
+            temp_vals.append(t)
+        p = _try_float(_parse_rocmsmi_value("Average Graphics Package Power", line + "\n"))
+        if p is not None:
+            power_vals.append(p)
+
+    if vram_vals:  peaks["vram_pct"]  = str(max(vram_vals))
+    if gpu_vals:   peaks["gpu_pct"]   = str(max(gpu_vals))
+    if temp_vals:  peaks["temp_c"]    = str(max(temp_vals))
+    if power_vals: peaks["power_w"]   = str(max(power_vals))
+
+    return peaks
+
+
+def _try_float(s):
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+
 def get_vllm_status():
     pid = run("pgrep -f 'vllm serve' | head -1")
-    if pid and pid != "N/A":
+    if pid:
         uptime = run(f"ps -o etime= -p {pid} 2>/dev/null").strip()
         return {"running": True, "pid": pid, "uptime": uptime}
     return {"running": False, "pid": None, "uptime": None}
@@ -87,209 +134,374 @@ def get_vllm_status():
 
 def get_disk_usage():
     workspace = run("df -h /workspace 2>/dev/null | tail -1 | awk '{print $2, $3, $4, $5}'")
-    root = run("df -h / 2>/dev/null | tail -1 | awk '{print $2, $3, $4, $5}'")
+    root      = run("df -h / 2>/dev/null | tail -1 | awk '{print $2, $3, $4, $5}'")
     return {"workspace": workspace, "root": root}
 
 
-def get_recent_serve_log():
-    log = Path("/workspace/serve_awq.log")
-    if not log.exists():
-        return "Log not found."
-    lines = log.read_text().splitlines()
-    return "\n".join(lines[-20:])
+def get_vllm_metrics():
+    """Fetch Prometheus /metrics and return request/token counts."""
+    result = {
+        "requests_ok":     "—",
+        "requests_failed": "—",
+        "tokens_generated":"—",
+        "tokens_prompt":   "—",
+        "running_requests":"—",
+        "waiting_requests":"—",
+    }
+    try:
+        with urlopen(METRICS_URL, timeout=3) as r:
+            text = r.read().decode()
+    except (URLError, Exception):
+        return result
+
+    def _prometheus_sum(name, text):
+        total = 0.0
+        found = False
+        for line in text.splitlines():
+            if line.startswith(name + "{") or line.startswith(name + " "):
+                m = re.search(r'\s+([\d.eE+\-]+)\s*$', line)
+                if m:
+                    total += float(m.group(1))
+                    found = True
+        return f"{int(total):,}" if found else "—"
+
+    def _prometheus_gauge(name, text):
+        for line in text.splitlines():
+            if line.startswith(name + "{") or line.startswith(name + " "):
+                m = re.search(r'\s+([\d.eE+\-]+)\s*$', line)
+                if m:
+                    return f"{int(float(m.group(1)))}"
+        return "—"
+
+    result["requests_ok"]      = _prometheus_sum("vllm:request_success_total", text)
+    result["requests_failed"]  = _prometheus_sum("vllm:request_failure_total", text)
+    result["tokens_generated"] = _prometheus_sum("vllm:generation_tokens_total", text)
+    result["tokens_prompt"]    = _prometheus_sum("vllm:prompt_tokens_total", text)
+    result["running_requests"] = _prometheus_gauge("vllm:num_requests_running", text)
+    result["waiting_requests"] = _prometheus_gauge("vllm:num_requests_waiting", text)
+    return result
 
 
-# ── HTML builders ─────────────────────────────────────────────────────────────
+# ── HTML style ────────────────────────────────────────────────────────────────
 
 STYLE = """
 <style>
+  * { box-sizing: border-box; }
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-         background: #f4f6f9; margin: 0; padding: 20px; color: #1a1a2e; }
-  .wrapper { max-width: 680px; margin: 0 auto; }
-  .header { background: linear-gradient(135deg, #e84040 0%, #c0392b 100%);
-            border-radius: 12px 12px 0 0; padding: 28px 32px; color: white; }
-  .header h1 { margin: 0 0 4px; font-size: 22px; font-weight: 700; }
-  .header p  { margin: 0; font-size: 13px; opacity: 0.85; }
-  .card { background: white; border-radius: 0; padding: 24px 32px;
-          border-bottom: 1px solid #eef0f4; }
-  .card:last-child { border-radius: 0 0 12px 12px; border-bottom: none; }
-  .card h2 { margin: 0 0 16px; font-size: 14px; font-weight: 600;
-             text-transform: uppercase; letter-spacing: 0.05em; color: #7f8c8d; }
-  table { width: 100%; border-collapse: collapse; font-size: 14px; }
-  th { background: #f8f9fa; padding: 10px 14px; text-align: left;
-       font-weight: 600; color: #555; border-bottom: 2px solid #eee; }
-  td { padding: 10px 14px; border-bottom: 1px solid #f0f0f0; color: #333; }
+         background: #f0f2f5; margin: 0; padding: 24px; color: #1a1a2e; }
+  .wrapper { max-width: 700px; margin: 0 auto; }
+
+  .header { background: linear-gradient(135deg, #1a1a2e 0%, #16213e 60%, #0f3460 100%);
+            border-radius: 14px 14px 0 0; padding: 32px 36px 28px; color: white; }
+  .header .tag { font-size: 11px; font-weight: 700; letter-spacing: 0.12em;
+                 text-transform: uppercase; opacity: 0.6; margin-bottom: 8px; }
+  .header h1 { margin: 0 0 6px; font-size: 24px; font-weight: 800; }
+  .header p  { margin: 0; font-size: 13px; opacity: 0.7; }
+
+  .card { background: white; padding: 28px 36px; border-bottom: 1px solid #edf0f5; }
+  .card:last-of-type { border-radius: 0 0 14px 14px; border-bottom: none; }
+  .section-title { font-size: 11px; font-weight: 700; letter-spacing: 0.1em;
+                   text-transform: uppercase; color: #94a3b8; margin: 0 0 18px; }
+
+  /* 4-up metric grid */
+  .grid4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+  .mbox { background: #f8fafc; border: 1px solid #e8ecf2;
+          border-radius: 10px; padding: 16px 12px; text-align: center; }
+  .mbox .val { font-size: 26px; font-weight: 800; color: #0f3460; line-height: 1; }
+  .mbox .unit { font-size: 13px; font-weight: 600; color: #64748b; }
+  .mbox .lbl { font-size: 11px; color: #94a3b8; margin-top: 6px; }
+  .mbox.warn .val { color: #d97706; }
+  .mbox.crit .val { color: #dc2626; }
+  .mbox.ok   .val { color: #16a34a; }
+
+  /* 2-col comparison grid (current vs peak) */
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 20px; }
+  .col-label { font-size: 11px; font-weight: 700; text-transform: uppercase;
+               letter-spacing: 0.08em; margin-bottom: 10px; }
+  .col-label.current { color: #3b82f6; }
+  .col-label.peak    { color: #f59e0b; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  th { background: #f8fafc; padding: 9px 14px; text-align: left;
+       font-weight: 600; color: #64748b; border-bottom: 2px solid #e8ecf2;
+       font-size: 12px; }
+  td { padding: 9px 14px; border-bottom: 1px solid #f1f4f9; color: #334155; }
   tr:last-child td { border-bottom: none; }
+  tr:hover td { background: #fafbfc; }
+
   .badge { display: inline-block; padding: 3px 10px; border-radius: 20px;
-           font-size: 12px; font-weight: 600; }
-  .badge-ok  { background: #e8f5e9; color: #2e7d32; }
-  .badge-warn { background: #fff3e0; color: #e65100; }
-  .badge-crit { background: #ffebee; color: #c62828; }
-  .badge-down { background: #f5f5f5; color: #757575; }
-  .metric-big { font-size: 28px; font-weight: 700; color: #2c3e50; }
-  .metric-label { font-size: 12px; color: #999; margin-top: 2px; }
-  .metrics-row { display: flex; gap: 16px; flex-wrap: wrap; }
-  .metric-box { flex: 1; min-width: 120px; background: #f8f9fa;
-                border-radius: 8px; padding: 16px; text-align: center; }
-  .alert-banner { background: #fff3cd; border: 1px solid #ffc107;
-                  border-radius: 8px; padding: 16px; margin-bottom: 8px; }
-  .alert-banner.critical { background: #f8d7da; border-color: #dc3545; }
-  pre { background: #1e1e2e; color: #cdd6f4; border-radius: 8px;
+           font-size: 11.5px; font-weight: 700; }
+  .badge-ok   { background: #dcfce7; color: #15803d; }
+  .badge-warn { background: #fef3c7; color: #b45309; }
+  .badge-crit { background: #fee2e2; color: #b91c1c; }
+  .badge-down { background: #f1f5f9; color: #64748b; }
+  .badge-up   { background: #dbeafe; color: #1d4ed8; }
+
+  .stat-row { display: flex; justify-content: space-between;
+              padding: 8px 0; border-bottom: 1px solid #f1f4f9; font-size: 13.5px; }
+  .stat-row:last-child { border-bottom: none; }
+  .stat-key { color: #64748b; }
+  .stat-val { font-weight: 600; color: #1e293b; }
+
+  .alert-box { background: #fff1f2; border: 1.5px solid #fca5a5;
+               border-radius: 10px; padding: 18px 20px; margin-bottom: 18px; }
+  .alert-box h3 { margin: 0 0 6px; color: #dc2626; font-size: 15px; }
+  .alert-box p  { margin: 0; color: #7f1d1d; font-size: 13.5px; }
+
+  pre { background: #0f172a; color: #94a3b8; border-radius: 10px;
         padding: 16px; font-size: 12px; overflow-x: auto;
-        white-space: pre-wrap; word-break: break-all; }
-  .footer { text-align: center; padding: 16px; font-size: 12px; color: #aaa; }
+        white-space: pre; font-family: 'JetBrains Mono', 'Fira Code', monospace; }
+
+  .divider { border: none; border-top: 1px solid #e8ecf2; margin: 20px 0; }
+
+  .footer { text-align: center; padding: 18px; font-size: 12px; color: #94a3b8;
+            background: white; border-radius: 0 0 14px 14px; }
+  .footer a { color: #3b82f6; text-decoration: none; }
 </style>
 """
 
 
+# ── helpers ───────────────────────────────────────────────────────────────────
+
 def vram_badge(pct_str):
     try:
-        pct = float(pct_str)
-        if pct >= 90:
-            return f'<span class="badge badge-crit">{pct}% CRITICAL</span>'
-        elif pct >= 85:
-            return f'<span class="badge badge-warn">{pct}% WARNING</span>'
-        else:
-            return f'<span class="badge badge-ok">{pct}% OK</span>'
+        p = float(pct_str)
+        if p >= 90:   return f'<span class="badge badge-crit">{p:.0f}% CRITICAL</span>'
+        if p >= 85:   return f'<span class="badge badge-warn">{p:.0f}% WARNING</span>'
+        return             f'<span class="badge badge-ok">{p:.0f}% OK</span>'
     except Exception:
         return f'<span class="badge badge-down">{pct_str}</span>'
 
 
-def build_daily_html(gpu, vllm, disk, now):
-    vllm_badge = ('<span class="badge badge-ok">Running</span>' if vllm["running"]
-                  else '<span class="badge badge-down">Stopped</span>')
+def temp_badge(t_str):
+    try:
+        t = float(t_str)
+        if t >= 90: return f'<span class="badge badge-crit">{t:.0f} °C</span>'
+        if t >= 75: return f'<span class="badge badge-warn">{t:.0f} °C</span>'
+        return           f'<span class="badge badge-ok">{t:.0f} °C</span>'
+    except Exception:
+        return f'<span class="badge badge-down">{t_str}</span>'
 
-    metrics_row = f"""
-    <div class="metrics-row">
-      <div class="metric-box">
-        <div class="metric-big">{gpu['vram_pct']}%</div>
-        <div class="metric-label">VRAM Used</div>
-      </div>
-      <div class="metric-box">
-        <div class="metric-big">{gpu['gpu_pct']}%</div>
-        <div class="metric-label">GPU Utilisation</div>
-      </div>
-      <div class="metric-box">
-        <div class="metric-big">{gpu['temp_c']}°C</div>
-        <div class="metric-label">Die Temperature</div>
-      </div>
-      <div class="metric-box">
-        <div class="metric-big">{gpu['power_w']}W</div>
-        <div class="metric-label">Power Draw</div>
-      </div>
-    </div>
-    """
 
-    uptime_str = f"PID {vllm['pid']} · Uptime {vllm['uptime']}" if vllm["running"] else "Not running"
+def mbox_class(label, val_str):
+    label = label.lower()
+    try:
+        v = float(val_str)
+        if "vram" in label or "gpu" in label:
+            if v >= 90: return "crit"
+            if v >= 75: return "warn"
+            return "ok"
+        if "temp" in label:
+            if v >= 90: return "crit"
+            if v >= 75: return "warn"
+            return "ok"
+    except Exception:
+        pass
+    return ""
 
-    return f"""<!DOCTYPE html><html><head><meta charset="utf-8">{STYLE}</head><body>
-<div class="wrapper">
+
+def metric_box(label, val, unit=""):
+    cls = mbox_class(label, val)
+    return f"""
+    <div class="mbox {cls}">
+      <div class="val">{val}</div>
+      <div class="unit">{unit}</div>
+      <div class="lbl">{label}</div>
+    </div>"""
+
+
+def disk_table(disk):
+    def row(mount, data):
+        parts = data.split()
+        cols = parts + [""] * (4 - len(parts))
+        return f"<tr><td><b>{mount}</b></td>{''.join(f'<td>{c}</td>' for c in cols[:4])}</tr>"
+    return f"""
+    <table>
+      <tr><th>Mount</th><th>Total</th><th>Used</th><th>Free</th><th>Use%</th></tr>
+      {row('/workspace', disk['workspace'])}
+      {row('/ (root)', disk['root'])}
+    </table>"""
+
+
+# ── HTML builders ─────────────────────────────────────────────────────────────
+
+def build_daily_html(gpu, peaks, vllm, disk, metrics, now):
+    vllm_badge = ('<span class="badge badge-up">● Running</span>' if vllm["running"]
+                  else '<span class="badge badge-down">● Stopped</span>')
+    uptime_str = f"PID {vllm['pid']} · uptime {vllm['uptime']}" if vllm["running"] else "Not running"
+
+    current_grid = f"""
+    <div class="grid4">
+      {metric_box("VRAM Used", gpu['vram_pct'], "%")}
+      {metric_box("GPU Compute", gpu['gpu_pct'], "%")}
+      {metric_box("Die Temp", gpu['temp_c'], "°C")}
+      {metric_box("Power Draw", gpu['power_w'], "W")}
+    </div>"""
+
+    peak_grid = f"""
+    <div class="grid4">
+      {metric_box("VRAM Peak", peaks['vram_pct'], "%")}
+      {metric_box("GPU Peak", peaks['gpu_pct'], "%")}
+      {metric_box("Max Temp", peaks['temp_c'], "°C")}
+      {metric_box("Max Power", peaks['power_w'], "W")}
+    </div>"""
+
+    requests_section = f"""
+    <div class="card">
+      <p class="section-title">Today's vLLM Request Stats</p>
+      <div class="stat-row">
+        <span class="stat-key">Successful requests</span>
+        <span class="stat-val">{metrics['requests_ok']}</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-key">Failed requests</span>
+        <span class="stat-val">{metrics['requests_failed']}</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-key">Tokens generated</span>
+        <span class="stat-val">{metrics['tokens_generated']}</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-key">Prompt tokens processed</span>
+        <span class="stat-val">{metrics['tokens_prompt']}</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-key">Requests running now</span>
+        <span class="stat-val">{metrics['running_requests']}</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-key">Requests waiting now</span>
+        <span class="stat-val">{metrics['waiting_requests']}</span>
+      </div>
+    </div>"""
+
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">{STYLE}</head>
+<body><div class="wrapper">
+
   <div class="header">
-    <h1>AMD MI300X · Daily GPU Report</h1>
-    <p>{now.strftime('%A, %B %d %Y · %H:%M UTC')} &nbsp;|&nbsp; Pod: mv4dfc2mn9l8zc &nbsp;|&nbsp; Model: qwen3.6-35b-a3b-awq</p>
+    <div class="tag">GPU Monitor · RunPod AMD MI300X</div>
+    <h1>Daily GPU Report</h1>
+    <p>{now.strftime('%A, %B %d %Y')} &nbsp;·&nbsp; {now.strftime('%H:%M')} UTC &nbsp;·&nbsp; Model: qwen3.6-35b-a3b-awq</p>
   </div>
 
   <div class="card">
-    <h2>GPU Health</h2>
-    {metrics_row}
-    <br>
-    <table>
-      <tr><th>Metric</th><th>Value</th><th>Status</th></tr>
-      <tr><td>VRAM Utilisation</td><td>{gpu['vram_pct']}%</td><td>{vram_badge(gpu['vram_pct'])}</td></tr>
-      <tr><td>GPU Compute</td><td>{gpu['gpu_pct']}%</td><td><span class="badge badge-ok">&nbsp;</span></td></tr>
-      <tr><td>Die Temperature</td><td>{gpu['temp_c']} °C</td><td><span class="badge badge-ok">&nbsp;</span></td></tr>
-      <tr><td>Power Draw</td><td>{gpu['power_w']} W &nbsp;<small>(cap: 750 W)</small></td><td><span class="badge badge-ok">&nbsp;</span></td></tr>
-    </table>
+    <p class="section-title">Current Snapshot</p>
+    {current_grid}
+    <hr class="divider">
+    <p class="section-title">Today's Peak (from daily log)</p>
+    {peak_grid}
+  </div>
+
+  {requests_section}
+
+  <div class="card">
+    <p class="section-title">vLLM Server</p>
+    <div class="stat-row">
+      <span class="stat-key">Status</span>
+      <span class="stat-val">{vllm_badge}</span>
+    </div>
+    <div class="stat-row">
+      <span class="stat-key">Process</span>
+      <span class="stat-val">{uptime_str}</span>
+    </div>
+    <div class="stat-row">
+      <span class="stat-key">Endpoint</span>
+      <span class="stat-val"><code>http://localhost:8000/v1</code></span>
+    </div>
   </div>
 
   <div class="card">
-    <h2>vLLM Server</h2>
-    <table>
-      <tr><th>Item</th><th>Value</th></tr>
-      <tr><td>Status</td><td>{vllm_badge}</td></tr>
-      <tr><td>Details</td><td>{uptime_str}</td></tr>
-      <tr><td>Endpoint</td><td>https://mv4dfc2mn9l8zc-8000.proxy.runpod.net/v1</td></tr>
-    </table>
+    <p class="section-title">Disk Usage</p>
+    {disk_table(disk)}
   </div>
 
   <div class="card">
-    <h2>Disk Usage</h2>
-    <table>
-      <tr><th>Mount</th><th>Size</th><th>Used</th><th>Free</th><th>Use%</th></tr>
-      <tr><td>/workspace</td>
-          {"".join(f"<td>{v}</td>" for v in disk['workspace'].split())}
-      </tr>
-      <tr><td>/ (root overlay)</td>
-          {"".join(f"<td>{v}</td>" for v in disk['root'].split())}
-      </tr>
-    </table>
-  </div>
-
-  <div class="card">
-    <h2>rocm-smi Output</h2>
+    <p class="section-title">rocm-smi Raw Output</p>
     <pre>{gpu['raw']}</pre>
   </div>
 
   <div class="footer">
-    Generated by Qwen-AMD monitoring · <a href="https://github.com/AjithThaduri/Qwen-AMD">AjithThaduri/Qwen-AMD</a>
+    Generated by Qwen-AMD monitoring &nbsp;·&nbsp;
+    <a href="https://github.com/AjithThaduri/Qwen-AMD">AjithThaduri/Qwen-AMD</a>
   </div>
-</div>
-</body></html>"""
+
+</div></body></html>"""
 
 
 def build_alert_html(gpu, vllm, reason, now):
-    return f"""<!DOCTYPE html><html><head><meta charset="utf-8">{STYLE}</head><body>
-<div class="wrapper">
-  <div class="header" style="background: linear-gradient(135deg, #c0392b 0%, #922b21 100%);">
-    <h1>⚠ VRAM Alert — AMD MI300X</h1>
-    <p>{now.strftime('%A, %B %d %Y · %H:%M UTC')} &nbsp;|&nbsp; Pod: mv4dfc2mn9l8zc</p>
+    try:
+        vram = float(gpu["vram_pct"])
+        vram_display = f"{vram:.0f}%"
+    except Exception:
+        vram_display = gpu["vram_pct"]
+
+    uptime_str = (f"Running — PID {vllm['pid']}, uptime {vllm['uptime']}"
+                  if vllm["running"] else "NOT RUNNING")
+
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">{STYLE}</head>
+<body><div class="wrapper">
+
+  <div class="header" style="background: linear-gradient(135deg, #7f1d1d 0%, #991b1b 60%, #dc2626 100%);">
+    <div class="tag">Alert · RunPod AMD MI300X</div>
+    <h1>⚠ VRAM High — {vram_display}</h1>
+    <p>{now.strftime('%A, %B %d %Y · %H:%M UTC')}</p>
   </div>
 
   <div class="card">
-    <div class="alert-banner critical">
-      <strong>VRAM usage exceeded 85% threshold</strong><br>
-      Current usage: <strong>{gpu['vram_pct']}%</strong> &nbsp;·&nbsp; Threshold: 85%
+    <div class="alert-box">
+      <h3>VRAM exceeded 85% alert threshold</h3>
+      <p>Current usage: <strong>{vram_display}</strong> &nbsp;·&nbsp; Threshold: 85%</p>
     </div>
-    <h2>What This Means</h2>
+
+    <p class="section-title">GPU State at Alert Time</p>
+    <div class="grid4">
+      {metric_box("VRAM Used", gpu['vram_pct'], "%")}
+      {metric_box("GPU Compute", gpu['gpu_pct'], "%")}
+      {metric_box("Die Temp", gpu['temp_c'], "°C")}
+      {metric_box("Power Draw", gpu['power_w'], "W")}
+    </div>
+  </div>
+
+  <div class="card">
+    <p class="section-title">Why This Happened</p>
+    <p style="color:#334155; font-size:13.5px; margin:0 0 14px">{reason}</p>
     <table>
-      <tr><th>Item</th><th>Value</th><th>Note</th></tr>
-      <tr><td>VRAM Used</td><td>{gpu['vram_pct']}%</td>
-          <td>vLLM is configured at <code>--gpu-memory-utilization 0.85</code>.
-              Usage above this may indicate KV cache pressure under heavy load.</td></tr>
-      <tr><td>GPU Compute</td><td>{gpu['gpu_pct']}%</td><td>Active inference load</td></tr>
-      <tr><td>Temperature</td><td>{gpu['temp_c']} °C</td><td>Normal range: &lt;90°C</td></tr>
-      <tr><td>Power</td><td>{gpu['power_w']} W</td><td>Cap: 750 W</td></tr>
+      <tr><th>Cause</th><th>Explanation</th></tr>
+      <tr><td>KV cache pressure</td><td>Long conversations or many concurrent requests fill the KV cache. Model weights use ~24 GB; remaining ~138 GB is KV cache.</td></tr>
+      <tr><td>Concurrent load spike</td><td>More simultaneous users than the current <code>--gpu-memory-utilization 0.85</code> allocation allows.</td></tr>
+      <tr><td>Single long context</td><td>A request with a very long prompt + output can temporarily spike VRAM above steady-state.</td></tr>
+    </table>
+
+    <hr class="divider">
+    <p class="section-title">Recommended Actions</p>
+    <table>
+      <tr><th>Action</th><th>How</th></tr>
+      <tr><td>Check live requests</td><td><code>curl http://localhost:8000/metrics | grep vllm:num_requests</code></td></tr>
+      <tr><td>Check vLLM log</td><td><code>tmux attach -t vllm</code> (window 0)</td></tr>
+      <tr><td>Restart if OOM risk</td><td><code>tmux attach -t vllm</code> → Ctrl+C → re-run serve command</td></tr>
+      <tr><td>Reduce context</td><td>Add <code>--max-model-len 16384</code> to vLLM serve to free KV cache headroom</td></tr>
     </table>
   </div>
 
   <div class="card">
-    <h2>Why It Happened</h2>
-    <p>{reason}</p>
-    <ul>
-      <li><strong>KV cache growth:</strong> Long conversations or many concurrent requests fill the KV cache.</li>
-      <li><strong>Concurrent load spike:</strong> More simultaneous users than the KV cache can hold.</li>
-      <li><strong>Model weights + KV cache:</strong> Model uses ~24 GB; remaining ~138 GB is KV cache. Under 50+ concurrent users this fills fast.</li>
-    </ul>
-    <p><strong>Recommended actions:</strong></p>
-    <ul>
-      <li>Check active requests: <code>curl http://localhost:8000/metrics</code></li>
-      <li>If OOM risk is high, restart vLLM: <code>tmux attach -t vllm</code> → Ctrl+C → re-run serve command</li>
-      <li>Consider reducing <code>--max-model-len</code> to free KV cache space</li>
-    </ul>
-  </div>
-
-  <div class="card">
-    <h2>vLLM Server Status</h2>
-    <p>{"Running — PID " + str(vllm["pid"]) + ", uptime " + str(vllm["uptime"]) if vllm["running"] else "NOT RUNNING"}</p>
-    <h2>rocm-smi</h2>
+    <p class="section-title">vLLM Server Status</p>
+    <div class="stat-row">
+      <span class="stat-key">Status</span>
+      <span class="stat-val">{uptime_str}</span>
+    </div>
+    <hr class="divider">
+    <p class="section-title">rocm-smi</p>
     <pre>{gpu['raw']}</pre>
   </div>
 
   <div class="footer">
-    Generated by Qwen-AMD monitoring · <a href="https://github.com/AjithThaduri/Qwen-AMD">AjithThaduri/Qwen-AMD</a>
+    Generated by Qwen-AMD monitoring &nbsp;·&nbsp;
+    <a href="https://github.com/AjithThaduri/Qwen-AMD">AjithThaduri/Qwen-AMD</a>
   </div>
-</div>
-</body></html>"""
+
+</div></body></html>"""
 
 
 # ── send ──────────────────────────────────────────────────────────────────────
@@ -299,7 +511,6 @@ def send_email(cfg, subject, html_body):
     msg["Subject"] = subject
     msg["From"]    = cfg["EMAIL_FROM"]
     msg["To"]      = ", ".join(cfg["EMAIL_TO"].split(","))
-
     msg.attach(MIMEText(html_body, "html"))
 
     with smtplib.SMTP(cfg["EMAIL_SMTP_HOST"], int(cfg["EMAIL_SMTP_PORT"])) as s:
@@ -308,7 +519,7 @@ def send_email(cfg, subject, html_body):
         s.login(cfg["EMAIL_SMTP_USER"], cfg["EMAIL_SMTP_PASSWORD"])
         s.sendmail(cfg["EMAIL_FROM"], cfg["EMAIL_TO"].split(","), msg.as_string())
 
-    print(f"[{datetime.utcnow():%H:%M:%S}] Email sent: {subject}")
+    print(f"[{datetime.now(timezone.utc):%H:%M:%S}] Email sent: {subject}")
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -316,21 +527,27 @@ def send_email(cfg, subject, html_body):
 def main():
     parser = argparse.ArgumentParser()
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--daily",  action="store_true", help="Send daily report")
-    group.add_argument("--alert",  action="store_true", help="Send VRAM alert")
-    group.add_argument("--test",   action="store_true", help="Send test email")
+    group.add_argument("--daily", action="store_true")
+    group.add_argument("--alert", action="store_true")
+    group.add_argument("--test",  action="store_true")
     args = parser.parse_args()
 
-    cfg  = load_config()
-    now  = datetime.utcnow()
-    gpu  = get_gpu_stats()
-    vllm = get_vllm_status()
-    disk = get_disk_usage()
+    cfg   = load_config()
+    now   = datetime.now(timezone.utc)
+    gpu   = get_gpu_stats()
+    vllm  = get_vllm_status()
+    disk  = get_disk_usage()
 
-    if args.daily:
-        subject = f"[MI300X] Daily GPU Report — {now.strftime('%b %d %Y')}"
-        html    = build_daily_html(gpu, vllm, disk, now)
+    if args.daily or args.test:
+        peaks   = get_peak_stats_today()
+        metrics = get_vllm_metrics()
+        subject = (f"[MI300X] Daily GPU Report — {now.strftime('%b %d %Y')}"
+                   if args.daily else
+                   f"[MI300X] Test Email — {now.strftime('%b %d %Y %H:%M UTC')}")
+        html = build_daily_html(gpu, peaks, vllm, disk, metrics, now)
         send_email(cfg, subject, html)
+        if args.test:
+            print("Test email sent.")
 
     elif args.alert:
         try:
@@ -340,18 +557,12 @@ def main():
         if vram < 85:
             print(f"VRAM at {vram}% — below threshold, no alert sent.")
             return
-        reason = (f"VRAM is at {vram}%, which exceeds the 85% alert threshold. "
-                  f"The vLLM server is {'running' if vllm['running'] else 'NOT running'}. "
+        reason = (f"VRAM is at {vram:.0f}%, exceeding the 85% alert threshold. "
+                  f"vLLM is {'running (PID ' + str(vllm['pid']) + ')' if vllm['running'] else 'NOT running'}. "
                   f"GPU compute is at {gpu['gpu_pct']}%.")
-        subject = f"[MI300X] VRAM ALERT {vram}% — {now.strftime('%b %d %Y %H:%M UTC')}"
-        html    = build_alert_html(gpu, vllm, reason, now)
+        subject = f"[MI300X] VRAM ALERT {vram:.0f}% — {now.strftime('%b %d %H:%M UTC')}"
+        html = build_alert_html(gpu, vllm, reason, now)
         send_email(cfg, subject, html)
-
-    elif args.test:
-        subject = f"[MI300X] Test Email — {now.strftime('%b %d %Y %H:%M UTC')}"
-        html    = build_daily_html(gpu, vllm, disk, now)
-        send_email(cfg, subject, html)
-        print("Test email sent successfully.")
 
 
 if __name__ == "__main__":

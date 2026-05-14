@@ -24,6 +24,8 @@ DATASET_PATH="/workspace/benchmarks/datasets/ShareGPT_V3_unfiltered_cleaned_spli
 RATES=(1 5 10 20)
 NUM_PROMPTS=200
 NUM_WARMUPS=5
+SHAREGPT_OUTPUT_LEN=256   # fix reply-length so benchmark doesn't need EOS from model
+MAX_INPUT_LEN=31744         # leave room for output within 32768 context window
 PERCENTILE_METRICS="ttft,tpot,itl,e2el"
 METRIC_PERCENTILES="50,90,95,99"
 
@@ -89,6 +91,64 @@ if ! curl -sf "${ENDPOINT_BASE}/health" &>/dev/null && \
 fi
 log "✓ Server is up."
 
+# ── diagnostic: one-shot probe to surface exact 400 error ────────────────────
+
+log "Running 1-prompt probe to verify benchmark can reach the server..."
+PROBE_OUT=$(vllm bench serve \
+    --host localhost \
+    --port "$PORT" \
+    --endpoint /v1/chat/completions \
+    --model "$MODEL" \
+    --tokenizer "$TOKENIZER" \
+    --header "Authorization=Bearer ${API_KEY}" \
+    --dataset-name sharegpt \
+    --dataset-path "$DATASET_PATH" \
+    --sharegpt-output-len "$SHAREGPT_OUTPUT_LEN" \
+    --sharegpt-input-len "$MAX_INPUT_LEN" \
+    --num-prompts 1 \
+    --num-warmups 0 \
+    --request-rate 1 \
+    2>&1 || true)
+
+if echo "$PROBE_OUT" | grep -q "Successful requests: *[1-9]"; then
+    log "✓ Probe succeeded — proceeding to sweep."
+elif echo "$PROBE_OUT" | grep -q "Bad Request\|400"; then
+    log "✗ Probe got 400 Bad Request. Check vLLM serve log for the actual error detail:"
+    log "  tmux attach -t vllm   # look for 'ValueError' or 'chat template' lines"
+    log "Probe output:"
+    echo "$PROBE_OUT" | tail -20 | tee -a "$LOGFILE"
+    # Try completions endpoint as fallback
+    log "Retrying probe with /v1/completions endpoint..."
+    PROBE2=$(vllm bench serve \
+        --host localhost \
+        --port "$PORT" \
+        --endpoint /v1/completions \
+        --model "$MODEL" \
+        --tokenizer "$TOKENIZER" \
+        --header "Authorization=Bearer ${API_KEY}" \
+        --dataset-name sharegpt \
+        --dataset-path "$DATASET_PATH" \
+        --sharegpt-output-len "$SHAREGPT_OUTPUT_LEN" \
+        --sharegpt-input-len "$MAX_INPUT_LEN" \
+        --num-prompts 1 \
+        --num-warmups 0 \
+        --request-rate 1 \
+        2>&1 || true)
+    if echo "$PROBE2" | grep -q "Successful requests: *[1-9]"; then
+        log "✓ /v1/completions endpoint works — switching sweep to completions."
+        ENDPOINT_OVERRIDE="/v1/completions"
+    else
+        log "✗ Both endpoints failing. Dumping probe output for review:"
+        echo "$PROBE2" | tail -20 | tee -a "$LOGFILE"
+        log "Aborting sweep — fix the endpoint issue first."
+        exit 1
+    fi
+else
+    log "✓ Probe OK — proceeding."
+fi
+
+ENDPOINT_OVERRIDE="${ENDPOINT_OVERRIDE:-/v1/chat/completions}"
+
 # ── sweep ────────────────────────────────────────────────────────────────────
 
 declare -A P50_TTFT
@@ -105,12 +165,14 @@ for RATE in "${RATES[@]}"; do
     vllm bench serve \
         --host localhost \
         --port "$PORT" \
-        --endpoint /v1/chat/completions \
+        --endpoint "${ENDPOINT_OVERRIDE}" \
         --model "$MODEL" \
         --tokenizer "$TOKENIZER" \
-        --header "Authorization: Bearer ${API_KEY}" \
+        --header "Authorization=Bearer ${API_KEY}" \
         --dataset-name sharegpt \
         --dataset-path "$DATASET_PATH" \
+        --sharegpt-output-len "$SHAREGPT_OUTPUT_LEN" \
+        --sharegpt-input-len "$MAX_INPUT_LEN" \
         --num-prompts "$NUM_PROMPTS" \
         --num-warmups "$NUM_WARMUPS" \
         --request-rate "$RATE" \
