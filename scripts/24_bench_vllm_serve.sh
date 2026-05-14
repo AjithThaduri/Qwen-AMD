@@ -18,6 +18,7 @@ set -euo pipefail
 ENDPOINT_BASE="http://localhost:8000"
 PORT=8000
 MODEL="qwen3.6-35b-a3b-awq"
+TOKENIZER="/workspace/models/awq"        # local path — model name is a served alias, not a HF repo
 DATASET_PATH="/workspace/benchmarks/datasets/ShareGPT_V3_unfiltered_cleaned_split.json"
 RATES=(1 5 10 20)
 NUM_PROMPTS=200
@@ -105,6 +106,7 @@ for RATE in "${RATES[@]}"; do
         --port "$PORT" \
         --endpoint /v1/chat/completions \
         --model "$MODEL" \
+        --tokenizer "$TOKENIZER" \
         --dataset-name sharegpt \
         --dataset-path "$DATASET_PATH" \
         --num-prompts "$NUM_PROMPTS" \
