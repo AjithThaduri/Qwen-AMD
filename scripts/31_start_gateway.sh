@@ -11,7 +11,7 @@ set -euo pipefail
 SCRIPT="/workspace/scripts/30_api_gateway.py"
 STATS_DIR="/workspace/gateway_stats"
 LOG="${STATS_DIR}/gateway.log"
-PORT=8080
+PORT=8000
 
 ts() { date '+%H:%M:%S'; }
 
@@ -26,8 +26,8 @@ pkill -f "30_api_gateway" 2>/dev/null || true
 sleep 1
 
 # Check vLLM is up before starting gateway
-if ! curl -sf http://localhost:8000/health &>/dev/null; then
-    echo "[$(ts)] ERROR: vLLM is not running on port 8000. Start it first."
+if ! curl -sf http://localhost:8001/health &>/dev/null; then
+    echo "[$(ts)] ERROR: vLLM is not running on port 8001. Start it first."
     echo "  bash /workspace/scripts/19_start_vllm_tmux.sh"
     exit 1
 fi

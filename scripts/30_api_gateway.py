@@ -37,9 +37,9 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 # ── config ────────────────────────────────────────────────────────────────────
 
-VLLM_BASE     = "http://localhost:8000"
+VLLM_BASE     = "http://localhost:8001"  # vLLM on internal port 8001
 VLLM_INT_KEY  = "dev-test-key"          # internal vLLM key (never exposed)
-GATEWAY_PORT  = 8080
+GATEWAY_PORT  = 8000                    # gateway takes the public port
 
 # Public-facing API keys  (share only these with clients)
 API_KEYS = {

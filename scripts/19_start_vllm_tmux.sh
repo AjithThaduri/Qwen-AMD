@@ -19,9 +19,10 @@ tmux new-session -d -s vllm -x 220 -y 50
 tmux send-keys -t vllm \
     "source /workspace/vllm_rocm_env.sh && vllm serve /workspace/models/awq \
      --served-model-name qwen3.6-35b-a3b-awq \
-     --host 0.0.0.0 --port 8000 \
-     --max-model-len 8192 \
-     --gpu-memory-utilization 0.85 \
+     --host 0.0.0.0 --port 8001 \
+     --max-model-len 16384 \
+     --gpu-memory-utilization 0.80 \
+     --max-num-seqs 100 \
      --trust-remote-code \
      --api-key dev-test-key \
      2>&1 | tee /workspace/serve_awq.log" Enter
