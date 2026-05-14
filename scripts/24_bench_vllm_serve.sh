@@ -19,6 +19,7 @@ ENDPOINT_BASE="http://localhost:8000"
 PORT=8000
 MODEL="qwen3.6-35b-a3b-awq"
 TOKENIZER="/workspace/models/awq"        # local path — model name is a served alias, not a HF repo
+API_KEY="dev-test-key"
 DATASET_PATH="/workspace/benchmarks/datasets/ShareGPT_V3_unfiltered_cleaned_split.json"
 RATES=(1 5 10 20)
 NUM_PROMPTS=200
@@ -107,6 +108,7 @@ for RATE in "${RATES[@]}"; do
         --endpoint /v1/chat/completions \
         --model "$MODEL" \
         --tokenizer "$TOKENIZER" \
+        --header "Authorization: Bearer ${API_KEY}" \
         --dataset-name sharegpt \
         --dataset-path "$DATASET_PATH" \
         --num-prompts "$NUM_PROMPTS" \
